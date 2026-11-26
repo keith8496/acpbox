@@ -38,6 +38,46 @@ class AcpStdioError(Exception):
     """Raised when ACP stdio handshake or call fails."""
 
 
+class AcpInvalidRequestError(AcpStdioError):
+    """Raised when a requested model or effort is not supported by the agent."""
+
+
+def _config_option(result: dict[str, Any], category: str) -> dict[str, Any] | None:
+    options = result.get("configOptions")
+    if isinstance(options, list):
+        for option in options:
+            if isinstance(option, dict) and option.get("category") == category:
+                return option
+    return None
+
+
+def _option_values(option: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    def visit(options: Any) -> None:
+        if not isinstance(options, list):
+            return
+        for item in options:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("value"), str):
+                values.append(item["value"])
+            visit(item.get("options"))
+    visit(option.get("options"))
+    return values
+
+
+def _model_ids(result: dict[str, Any], fallback: str = "default") -> list[str]:
+    option = _config_option(result, "model")
+    if option is not None:
+        return _option_values(option) or [fallback]
+    modes = result.get("modes")
+    if isinstance(modes, dict) and isinstance(modes.get("availableModes"), list):
+        ids = [str(m["id"]) for m in modes["availableModes"] if isinstance(m, dict) and m.get("id")]
+        if ids:
+            return ids
+    return [fallback]
+
+
 def _invoke_message_hook(
     on_message: AcpMessageHook | None,
     direction: Literal["send", "recv"],
@@ -294,34 +334,78 @@ class AcpRunner:
             on_message=self._message_hook,
         )
         self._next_id += 1
-        agent_name: str | None = None
-        modes = new_result.get("modes")
-        if isinstance(modes, dict):
-            available = modes.get("availableModes")
-            if isinstance(available, list) and len(available) > 0:
-                ids = []
-                for m in available:
-                    if isinstance(m, dict) and m.get("id"):
-                        ids.append(str(m["id"]))
-                if ids:
-                    return ids
-        return [agent_name or "default"]
+        return _model_ids(new_result)
+
+    async def _configure_session(
+        self, session_id: str, result: dict[str, Any], mode_id: str | None,
+        model_id: str | None, reasoning_effort: str | None, timeout: float,
+    ) -> None:
+        assert self._stdin_writer and self._stdout_reader
+
+        async def call(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            msg_id = self._next_id
+            self._next_id += 1
+            return await _request(self._stdin_writer, self._stdout_reader, msg_id,
+                                  method, params, timeout=timeout, on_message=self._message_hook)
+
+        async def set_option(option: dict[str, Any], value: str) -> dict[str, Any]:
+            option_id = option.get("id")
+            if not isinstance(option_id, str) or not option_id:
+                raise AcpStdioError("ACP configuration option is missing an id")
+            updated = await call("session/set_config_option", {
+                "sessionId": session_id, "configId": option_id, "value": value,
+            })
+            selected = _config_option(updated, str(option.get("category")))
+            if selected is None or selected.get("currentValue") != value:
+                raise AcpStdioError(f"ACP did not confirm configuration option {option_id}")
+            return updated
+
+        if mode_id:
+            await call("session/set_mode", {"sessionId": session_id, "modeId": mode_id})
+        model_option = _config_option(result, "model")
+        if model_id:
+            if model_option is not None:
+                if model_id not in _option_values(model_option):
+                    raise AcpInvalidRequestError(f"Unsupported model: {model_id}")
+                result = await set_option(model_option, model_id)
+            else:
+                modes = result.get("modes")
+                if isinstance(modes, dict) and isinstance(modes.get("availableModes"), list) and modes["availableModes"]:
+                    if model_id not in _model_ids(result):
+                        raise AcpInvalidRequestError(f"Unsupported model: {model_id}")
+                    await call("session/set_mode", {"sessionId": session_id, "modeId": model_id})
+                elif model_id != "default":
+                    raise AcpInvalidRequestError(f"Unsupported model: {model_id}")
+        if reasoning_effort is not None:
+            option = _config_option(result, "thought_level")
+            if option is None or reasoning_effort not in _option_values(option):
+                raise AcpInvalidRequestError(f"Unsupported reasoning effort: {reasoning_effort}")
+            result = await set_option(option, reasoning_effort)
+            if model_id and model_option is not None:
+                selected_model = _config_option(result, "model")
+                if selected_model is None or selected_model.get("currentValue") != model_id:
+                    raise AcpStdioError("ACP changed the selected model while setting reasoning effort")
 
     async def run_turn(
         self,
         prompt_blocks: Sequence[TextContentBlock | dict[str, Any]],
         mode_id: str | None = None,
         request_timeout: float = 300.0,
+        *,
+        model_id: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> tuple[str, str, list[dict[str, Any]]]:
         """Run one turn: session/new -> [session/set_mode] -> session/prompt. Serialized with _lock."""
         async with self._lock:
-            return await self._run_turn_unsafe(prompt_blocks, mode_id, request_timeout)
+            return await self._run_turn_unsafe(prompt_blocks, mode_id, request_timeout, model_id, reasoning_effort)
 
     async def _run_turn_unsafe(
         self,
         prompt_blocks: Sequence[TextContentBlock | dict[str, Any]],
         mode_id: str | None,
         request_timeout: float,
+        model_id: str | None,
+        reasoning_effort: str | None,
     ) -> tuple[str, str, list[dict[str, Any]]]:
         if not self._stdin_writer or not self._stdout_reader:
             raise AcpStdioError("ACP process not started")
@@ -340,17 +424,9 @@ class AcpRunner:
         session_id = new_result.get("sessionId")
         if not session_id:
             raise AcpStdioError("session/new did not return sessionId")
-        if mode_id:
-            await _request(
-                self._stdin_writer,
-                self._stdout_reader,
-                self._next_id,
-                "session/set_mode",
-                {"sessionId": session_id, "modeId": mode_id},
-                timeout=request_timeout,
-                on_message=self._message_hook,
-            )
-            self._next_id += 1
+        await self._configure_session(
+            session_id, new_result, mode_id, model_id, reasoning_effort, request_timeout
+        )
         prompt_id = self._next_id
         req = {
             "jsonrpc": "2.0",
@@ -412,6 +488,9 @@ class AcpRunner:
         prompt_blocks: Sequence[TextContentBlock | dict[str, Any]],
         mode_id: str | None = None,
         request_timeout: float = 300.0,
+        *,
+        model_id: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> AsyncGenerator[TurnStreamEvent, None]:
         """
         Same as run_turn but yield:
@@ -420,7 +499,7 @@ class AcpRunner:
         - (\"done\", stop_reason) at end.
         """
         async with self._lock:
-            async for ev in self._run_turn_stream_unsafe(prompt_blocks, mode_id, request_timeout):
+            async for ev in self._run_turn_stream_unsafe(prompt_blocks, mode_id, request_timeout, model_id, reasoning_effort):
                 yield ev
 
     async def _run_turn_stream_unsafe(
@@ -428,6 +507,8 @@ class AcpRunner:
         prompt_blocks: Sequence[TextContentBlock | dict[str, Any]],
         mode_id: str | None,
         request_timeout: float,
+        model_id: str | None,
+        reasoning_effort: str | None,
     ) -> AsyncGenerator[TurnStreamEvent, None]:
         if not self._stdin_writer or not self._stdout_reader:
             raise AcpStdioError("ACP process not started")
@@ -446,17 +527,9 @@ class AcpRunner:
         session_id = new_result.get("sessionId")
         if not session_id:
             raise AcpStdioError("session/new did not return sessionId")
-        if mode_id:
-            await _request(
-                self._stdin_writer,
-                self._stdout_reader,
-                self._next_id,
-                "session/set_mode",
-                {"sessionId": session_id, "modeId": mode_id},
-                timeout=request_timeout,
-                on_message=self._message_hook,
-            )
-            self._next_id += 1
+        await self._configure_session(
+            session_id, new_result, mode_id, model_id, reasoning_effort, request_timeout
+        )
         prompt_id = self._next_id
         req = {
             "jsonrpc": "2.0",
@@ -606,14 +679,7 @@ async def get_agent_models(
             {"cwd": work_dir, "mcpServers": []},
             timeout=timeout,
         )
-        modes = new_result.get("modes")
-        if isinstance(modes, dict):
-            available = modes.get("availableModes")
-            if isinstance(available, list) and len(available) > 0:
-                ids = [str(m["id"]) for m in available if isinstance(m, dict) and m.get("id")]
-                if ids:
-                    return ids
-        return [agent_name or "default"]
+        return _model_ids(new_result, agent_name or "default")
     finally:
         if proc.returncode is None:
             proc.terminate()
@@ -641,6 +707,8 @@ async def run_single_turn(
     *,
     mode_id: str | None = None,
     request_timeout: float = 300.0,
+    model_id: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """
     Spawn ACP agent, run one turn, then terminate. Used when no per-worker runner exists.
@@ -648,6 +716,6 @@ async def run_single_turn(
     runner = AcpRunner(command, env, workspace)
     await runner.start()
     try:
-        return await runner.run_turn(prompt_blocks, mode_id, request_timeout)
+        return await runner.run_turn(prompt_blocks, mode_id, request_timeout, model_id=model_id, reasoning_effort=reasoning_effort)
     finally:
         await runner.stop()

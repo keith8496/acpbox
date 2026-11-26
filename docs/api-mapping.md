@@ -2,16 +2,14 @@
 
 How each OpenAI-compatible endpoint is implemented using ACP over stdio.
 
-## Models (OpenAI) <- agent modes
+## Models (OpenAI) <- ACP configuration
 
-The list of "models" is the list of **agent operating modes** (ACP `session/new` response: `modes.availableModes[].id`). For example OpenCode reports `plan` and `build`. The gateway spawns the agent, calls `initialize` and `session/new`, and exposes these mode ids as OpenAI models.
-
-| OpenAI | Gateway | Notes |
-|--------|---------|--------|
-| `GET /v1/models` | Spawn agent -> `initialize` -> `session/new` | Returns `data` = list of `{ id: modeId, object: "model", created, owned_by: "acp" }`. 503 if agent fails. |
-| `GET /v1/models/{model}` | Same | If `model` is in the agent's availableModes (or fallback from agentInfo.name), return one model object; else 404. |
+`GET /v1/models` and `GET /v1/models/{model}` expose the values of the agent's model-category select option from `session/new.configOptions`. If no model selector is advertised, they retain the legacy fallback to `modes.availableModes[].id` (or `default`). Discovery failures return 503; a missing model returns 404.
 
 ## Chat Completions (stateless)
+
+The top-level OpenAI `model` is matched against the session's advertised model options and applied with `session/set_config_option` before prompting. The optional top-level `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`) is applied to the advertised thought-level option after model selection. The agent's updated configuration determines which efforts are supported for that model. Unsupported values return a 400 OpenAI-shaped error; omitted or null effort makes no explicit change. ACP mode is independent. For agents without a model selector, `model` retains its legacy ACP mode behavior; explicit effort is rejected if it cannot be mapped. This behavior applies to Chat Completions, not `/v1/responses`.
+
 
 | OpenAI | ACP (stdio) | Notes |
 |--------|-------------|--------|

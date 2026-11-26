@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from acpbox.acp_stdio import AcpStdioError
+from acpbox.acp_stdio import AcpInvalidRequestError, AcpStdioError
 from acpbox.errors import openai_error_body
 from acpbox.mapping import (
     StreamingToolCallParser,
@@ -34,6 +34,14 @@ async def create_chat_completion(
     request: Request,
 ):
     """POST /v1/chat/completions: use per-worker ACP runner, session/prompt, return chat completion or SSE stream."""
+    if body.reasoning_effort is not None and body.reasoning_effort not in {
+        "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=openai_error_body("Invalid reasoning_effort", "invalid_input"),
+        )
+
     tools_dump = [t.model_dump() for t in body.tools] if body.tools else None
     allowed_tool_names = resolve_allowed_tool_names(tools_dump, body.tool_choice)
     if allowed_tool_names is not None and not allowed_tool_names:
@@ -71,8 +79,14 @@ async def create_chat_completion(
     try:
         text, stop_reason, acp_updates = await runner.run_turn(
             prompt_blocks=prompt_blocks,
-            mode_id=body.model or None,
+            model_id=body.model,
+            reasoning_effort=body.reasoning_effort,
         )
+    except AcpInvalidRequestError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=openai_error_body(str(e), "invalid_input"),
+        ) from e
     except AcpStdioError as e:
         raise HTTPException(
             status_code=503,
@@ -100,13 +114,19 @@ async def _chat_completion_stream(
 
     agen = runner.run_turn_stream(
         prompt_blocks=prompt_blocks,
-        mode_id=body.model or None,
+        model_id=body.model,
+        reasoning_effort=body.reasoning_effort,
     )
     aiter = agen.__aiter__()
     try:
         first_evt = await aiter.__anext__()
     except StopAsyncIteration:
         first_evt = None
+    except AcpInvalidRequestError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=openai_error_body(str(e), "invalid_input"),
+        ) from e
     except AcpStdioError as e:
         raise HTTPException(
             status_code=503,

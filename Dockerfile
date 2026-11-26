@@ -15,13 +15,17 @@ RUN apt-get update \
 COPY . .
 RUN pip install --no-cache-dir . \
  && chown -R user:user /app \
- && mkdir -p /workspace \
- && chown user:user /workspace \
+ && mkdir -p /data/workspace \
+ && chown user:user /data/workspace \
  && chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
 
 USER user
+
+#RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
+# && which agy \
+# && agy --version
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["acpbox"]
