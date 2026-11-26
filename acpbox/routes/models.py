@@ -1,4 +1,4 @@
-"""OpenAI /v1/models from ACP agent modes (session/new availableModes)."""
+"""OpenAI /v1/models from ACP model options, with legacy mode fallback."""
 
 import logging
 import time
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("", response_model=ListModelsResponse)
 async def list_models(request: Request) -> ListModelsResponse:
-    """GET /v1/models returns agent modes (e.g. plan, build) from session/new availableModes."""
+    """GET /v1/models returns ACP model options, or legacy agent modes."""
     runner = request.app.state.runner
     try:
         models_list = await runner.get_agent_models()
@@ -36,7 +36,7 @@ async def list_models(request: Request) -> ListModelsResponse:
 
 @router.get("/{model_id}", response_model=ModelObject)
 async def get_model(model_id: str, request: Request) -> ModelObject:
-    """GET /v1/models/{model_id} returns model if in agent modes."""
+    """GET /v1/models/{model_id} returns an advertised model or legacy mode."""
     runner = request.app.state.runner
     try:
         models_list = await runner.get_agent_models()

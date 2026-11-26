@@ -26,6 +26,9 @@ class MockRunner:
         prompt_blocks: list[Any],
         mode_id: str | None = None,
         request_timeout: float = 300.0,
+        *,
+        model_id: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> tuple[str, str, list[dict[str, Any]]]:
         return ("Reply", "end_turn", [])
 
@@ -34,6 +37,9 @@ class MockRunner:
         prompt_blocks: list[Any],
         mode_id: str | None = None,
         request_timeout: float = 300.0,
+        *,
+        model_id: str | None = None,
+        reasoning_effort: str | None = None,
     ):
         yield ("text", "Reply")
         yield ("done", "end_turn")

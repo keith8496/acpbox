@@ -289,7 +289,7 @@ def test_chat_completion_non_stream_tool_calls(client, monkeypatch):
     """POST /v1/chat/completions (stream=false) parses bridged tool calls into OpenAI format."""
     captured: dict[str, object] = {}
 
-    async def _mock_run_turn(prompt_blocks, mode_id=None, request_timeout=300.0):
+    async def _mock_run_turn(prompt_blocks, mode_id=None, request_timeout=300.0, **kwargs):
         captured["prompt_text"] = prompt_blocks[0].text
         return (
             '<acpbox_tool_call>{"name": "list_documents", '
@@ -409,7 +409,7 @@ def test_chat_completion_multi_turn_tool_result_forwarded(client, monkeypatch):
     """Follow-up turn with assistant.tool_calls and role='tool' forwards tool results to runner."""
     captured: dict[str, object] = {}
 
-    async def _mock_run_turn(prompt_blocks, mode_id=None, request_timeout=300.0):
+    async def _mock_run_turn(prompt_blocks, mode_id=None, request_timeout=300.0, **kwargs):
         captured["prompt_text"] = prompt_blocks[0].text
         return ("Found 1 document awaiting review.", "end_turn", [])
 
@@ -459,11 +459,11 @@ def test_chat_completion_tool_choice_none_disables_parsing(client, monkeypatch):
     literal = '<acpbox_tool_call>{"name": "list_documents", "arguments": {}}</acpbox_tool_call>'
     captured: dict[str, object] = {}
 
-    async def _mock_run_turn(prompt_blocks, mode_id=None, request_timeout=300.0):
+    async def _mock_run_turn(prompt_blocks, mode_id=None, request_timeout=300.0, **kwargs):
         captured["prompt_text"] = prompt_blocks[0].text
         return (literal, "end_turn", [])
 
-    async def _mock_stream(prompt_blocks, mode_id=None, request_timeout=300.0):
+    async def _mock_stream(prompt_blocks, mode_id=None, request_timeout=300.0, **kwargs):
         captured["stream_prompt_text"] = prompt_blocks[0].text
         yield ("text", literal)
         yield ("done", "end_turn")
@@ -631,3 +631,49 @@ def test_chat_completion_forced_tool_choice_unknown_tool_returns_400(client, mon
         assert err["code"] == "invalid_input"
         assert "not_declared" in err["message"]
     assert called is False
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_forwards_model_and_effort(client, monkeypatch, stream):
+    seen = {}
+
+    async def run(*args, **kwargs):
+        seen.update(kwargs)
+        return ("Reply", "end_turn", [])
+
+    async def run_stream(*args, **kwargs):
+        seen.update(kwargs)
+        yield ("text", "Reply")
+        yield ("done", "end_turn")
+
+    monkeypatch.setattr(client.app.state.runner, "run_turn", run)
+    monkeypatch.setattr(client.app.state.runner, "run_turn_stream", run_stream)
+    response = client.post("/v1/chat/completions", json={
+        "model": "beta", "reasoning_effort": "high", "stream": stream,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    assert response.status_code == 200
+    assert seen["model_id"] == "beta"
+    assert seen["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_invalid_agent_configuration_is_400(client, monkeypatch, stream):
+    from acpbox.acp_stdio import AcpInvalidRequestError
+
+    async def fail(*args, **kwargs):
+        raise AcpInvalidRequestError("unsupported effort")
+
+    async def fail_stream(*args, **kwargs):
+        raise AcpInvalidRequestError("unsupported effort")
+        yield
+
+    monkeypatch.setattr(client.app.state.runner, "run_turn", fail)
+    monkeypatch.setattr(client.app.state.runner, "run_turn_stream", fail_stream)
+    response = client.post("/v1/chat/completions", json={
+        "model": "beta", "reasoning_effort": "high", "stream": stream,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_input"
+    assert "unsupported effort" in response.json()["error"]["message"]

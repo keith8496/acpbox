@@ -47,6 +47,7 @@ class ChatCompletionMessage(BaseModel):
 
 class CreateChatCompletionRequest(BaseModel):
     model: str
+    reasoning_effort: str | None = None
     messages: list[ChatCompletionMessage]
     stream: bool = False
     max_tokens: int | None = None
